@@ -43,7 +43,7 @@ class VoiceChatAgent:
         sample_rate: int = 16000,
         chunk_duration: float = 0.5,
         speech_threshold: float = 0.5,
-        silence_duration: float = 1.0
+        silence_duration: float = 1.0,
     ):
         """
         Initialize the voice chat agent.
@@ -96,7 +96,7 @@ class VoiceChatAgent:
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
-            onnx=False
+            onnx=False,
         )
         self.vad_model = model
         (
