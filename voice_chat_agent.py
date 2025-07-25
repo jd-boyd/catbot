@@ -356,19 +356,20 @@ class VoiceChatAgent:
                             self.is_recording = True
                             self.audio_buffer = []
 
-                        # Add the original audio chunk to buffer
-                        self.audio_buffer.extend(audio_chunk)
+                        # Add the VAD chunk (not the full audio_chunk) to buffer
+                        self.audio_buffer.extend(vad_chunk)
                         self.silence_counter = 0
 
                     else:
                         if self.is_recording:
                             self.silence_counter += 1
-                            self.audio_buffer.extend(audio_chunk)
+                            # Add the VAD chunk to buffer during recording
+                            self.audio_buffer.extend(vad_chunk)
 
                             # Check if we've had enough silence to stop recording
-                            silence_duration = (
-                                self.silence_counter * self.chunk_duration
-                            )
+                            # Use VAD chunk duration instead of full chunk duration
+                            vad_chunk_duration = self.vad_chunk_size / self.sample_rate
+                            silence_duration = self.silence_counter * vad_chunk_duration
                             if silence_duration >= self.silence_duration:
                                 print("🤫 Silence detected, processing speech...")
                                 await self._process_speech()
