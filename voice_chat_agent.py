@@ -305,15 +305,9 @@ class VoiceChatAgent:
         processing_thread = threading.Thread(target=self._process_audio_loop, daemon=True)
         processing_thread.start()
         
-        # Start response handling thread
-        response_thread = threading.Thread(target=self._response_handler_loop, daemon=True)
-        response_thread.start()
-        
         try:
-            # Keep main thread alive
             while True:
-                import time
-                time.sleep(0.1)
+                asyncio.run(self._handle_responses())
                 
         except KeyboardInterrupt:
             print("\n🛑 Stopping voice chat...")
@@ -402,23 +396,10 @@ class VoiceChatAgent:
         except Exception as e:
             print(f"❌ Speech processing error: {e}")
             
-    def _response_handler_loop(self):
-        """Continuously handle Claude responses and TTS in a separate thread."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            while True:
-                loop.run_until_complete(self._handle_responses())
-        except Exception as e:
-            print(f"❌ Response handler error: {e}")
-            import traceback
-            traceback.print_exc()
-            
     async def _handle_responses(self):
         """Handle Claude responses and TTS."""
         try:
-            user_text = self.response_queue.get(timeout=0.1)
+            user_text = self.response_queue.get_nowait()
             
             print("🤖 Getting Claude response...")
             response = await self.get_claude_response(user_text)
@@ -427,14 +408,11 @@ class VoiceChatAgent:
             print("🔊 Converting to speech...")
             self.synthesize_speech(response)
             print("✅ Response complete!\n")
-            print("🎙️  Listening for more speech...")
             
         except queue.Empty:
             await asyncio.sleep(0.1)
         except Exception as e:
             print(f"❌ Response handling error: {e}")
-            import traceback
-            traceback.print_exc()
 
 
 def main():
