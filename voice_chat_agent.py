@@ -16,6 +16,7 @@ import numpy as np
 import tempfile
 import os
 import io
+import argparse
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ class VoiceChatAgent:
         chunk_duration: float = 0.5,
         speech_threshold: float = 0.5,
         silence_duration: float = 1.0,
+        playback_audio: bool = False,
     ):
         """
         Initialize the voice chat agent.
@@ -57,6 +59,7 @@ class VoiceChatAgent:
             chunk_duration: Duration of each audio chunk in seconds
             speech_threshold: VAD threshold (0.0-1.0)
             silence_duration: Seconds of silence before processing speech
+            playback_audio: Whether to play back recorded audio before transcription
         """
         self.sample_rate = sample_rate
         self.chunk_duration = chunk_duration
@@ -67,6 +70,7 @@ class VoiceChatAgent:
         self.silence_duration = silence_duration
         self.piper_model_path = piper_model_path
         self.piper_config_path = piper_config_path
+        self.playback_audio = playback_audio
 
         # Initialize components
         self._init_vad()
@@ -386,6 +390,12 @@ class VoiceChatAgent:
             # Convert buffer to numpy array
             audio_array = np.array(self.audio_buffer, dtype=np.float32)
 
+            # Play back recorded audio if requested
+            if self.playback_audio:
+                print("🔊 Playing back recorded audio...")
+                self._playback_recorded_audio(audio_array)
+                print("✅ Playback complete")
+
             # Transcribe
             print("🎯 Transcribing...")
             text = self.transcribe_audio(audio_array)
@@ -401,6 +411,29 @@ class VoiceChatAgent:
 
         except Exception as e:
             print(f"❌ Speech processing error: {e}")
+
+    def _playback_recorded_audio(self, audio_data: np.ndarray):
+        """Play back the recorded audio data."""
+        try:
+            # Create temporary file for playback
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                # Write audio to temp file
+                with wave.open(tmp_file.name, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(self.sample_rate)
+                    # Convert float32 to int16
+                    audio_int16 = (audio_data * 32767).astype(np.int16)
+                    wav_file.writeframes(audio_int16.tobytes())
+
+                # Play the audio
+                self.play_audio_file(tmp_file.name)
+
+                # Clean up
+                os.unlink(tmp_file.name)
+
+        except Exception as e:
+            print(f"❌ Audio playback error: {e}")
 
     async def handle_responses(self):
         """Handle Claude responses and TTS."""
@@ -439,6 +472,34 @@ class VoiceChatAgent:
 
 async def main():
     """Main function to run the voice chat agent."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Voice Chat Agent with Claude")
+    parser.add_argument(
+        "--playback-audio",
+        action="store_true",
+        help="Play back recorded audio before transcription (useful for debugging)",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default="base",
+        choices=["tiny", "base", "small", "medium", "large"],
+        help="Whisper model size (default: base)",
+    )
+    parser.add_argument(
+        "--speech-threshold",
+        type=float,
+        default=0.5,
+        help="VAD speech detection threshold 0.0-1.0 (default: 0.5)",
+    )
+    parser.add_argument(
+        "--silence-duration",
+        type=float,
+        default=1.0,
+        help="Seconds of silence before processing speech (default: 1.0)",
+    )
+
+    args = parser.parse_args()
+
     # Configuration
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
     if not ANTHROPIC_API_KEY:
@@ -459,14 +520,21 @@ async def main():
         print("Make sure to download both .onnx and .json files")
         return
 
+    # Show configuration
+    if args.playback_audio:
+        print(
+            "🔊 Audio playback enabled - recorded audio will be played back before transcription"
+        )
+
     # Create and start the voice chat agent
     agent = VoiceChatAgent(
         anthropic_api_key=ANTHROPIC_API_KEY,
-        whisper_model="base",  # or "tiny" for faster processing
+        whisper_model=args.whisper_model,
         piper_model_path=PIPER_MODEL_PATH,
         piper_config_path=PIPER_CONFIG_PATH,
-        speech_threshold=0.5,  # Adjust based on your environment
-        silence_duration=1.0,  # Seconds of silence before processing
+        speech_threshold=args.speech_threshold,
+        silence_duration=args.silence_duration,
+        playback_audio=args.playback_audio,
     )
 
     await agent.start_listening()
