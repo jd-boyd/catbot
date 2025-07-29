@@ -2,9 +2,6 @@
 """
 Voice Chat Agent using Silero VAD, Whisper, Claude Sonnet 4, and Piper TTS
 Author: Joshua D. Boyd
-
-Dependencies:
-pip install torch torchaudio silero-vad openai-whisper anthropic langchain-anthropic langchain-core pyaudio wave numpy piper-tts strip-markdown
 """
 
 import asyncio

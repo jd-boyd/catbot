@@ -3,8 +3,6 @@
 Voice Chat Agent using Silero VAD, Whisper, Qwen2.5-VL, and Piper TTS
 Author: Joshua D. Boyd
 
-Dependencies:
-pip install torch torchaudio silero-vad openai-whisper transformers accelerate pyaudio wave numpy piper-tts strip-markdown qwen-vl-utils
 """
 
 import asyncio
