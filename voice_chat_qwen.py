@@ -17,16 +17,21 @@ import tempfile
 import os
 import io
 import argparse
+
+# Disable tokenizers parallelism warning in multiprocessing context
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
+import platform
+import subprocess
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
 
 import whisper
 from piper import PiperVoice
-from transformers import AutoTokenizer, AutoProcessor, AutoModelForVision2Seq
-from qwen_vl_utils import process_vision_info
+from mlx_lm import load, generate
 import strip_markdown
+import pyttsx3
 
 
 @dataclass
@@ -40,7 +45,7 @@ class VoiceChatAgent:
     def __init__(
         self,
         whisper_model: str = "base",
-        qwen_model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+        qwen_model_name: str = "mlx-community/Qwen3-1.7B-6bit",
         piper_model_path: str = "./piper_models/en_US-hfc_female-medium.onnx",
         piper_config_path: str = "./piper_models/en_US-hfc_female-medium.onnx.json",
         sample_rate: int = 16000,
@@ -82,7 +87,7 @@ class VoiceChatAgent:
         self._init_vad()
         self._init_whisper(whisper_model)
         self._init_qwen()
-        self._init_piper()
+        self._init_tts()
         self._init_audio()
 
         # State management
@@ -98,7 +103,10 @@ class VoiceChatAgent:
         print("🎤 Voice Chat Agent initialized!")
         print(f"Using Whisper model: {whisper_model}")
         print(f"Using Qwen model: {qwen_model_name}")
-        print(f"Using Piper model: {piper_model_path}")
+        if platform.system() == "Darwin":
+            print("Using Apple TTS with Samantha voice")
+        else:
+            print(f"Using Piper model: {piper_model_path}")
 
     def _init_vad(self):
         """Initialize Silero VAD model."""
@@ -126,34 +134,43 @@ class VoiceChatAgent:
         print("✅ Whisper loaded")
 
     def _init_qwen(self):
-        """Initialize Qwen2.5-VL model."""
+        """Initialize Qwen3 model using MLX."""
         print(f"Loading Qwen model: {self.qwen_model_name}...")
+        print("Using MLX framework for Apple Silicon optimization")
 
-        # Determine device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-
-        # Load processor and model for Qwen2.5-VL
-        self.qwen_processor = AutoProcessor.from_pretrained(
-            self.qwen_model_name, trust_remote_code=True
-        )
-
-        self.qwen_model = AutoModelForVision2Seq.from_pretrained(
-            self.qwen_model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        )
-
-        if not torch.cuda.is_available():
-            self.qwen_model = self.qwen_model.to(self.device)
+        # Load model and tokenizer using MLX-LM
+        self.qwen_model, self.qwen_tokenizer = load(self.qwen_model_name)
 
         # Initialize conversation with system message
         self.system_message = """You are a helpful voice assistant. Keep your responses very concise and conversational for speech. Avoid lists or complex formatting since this will be read aloud. Aim for responses under 50 words unless specifically asked for detailed information. Be direct and to the point."""
 
         self.conversation_history = []
         print("✅ Qwen model loaded")
+
+    def _init_tts(self):
+        """Initialize TTS model based on platform."""
+        if platform.system() == "Darwin":
+            # On macOS, we use Apple's TTS via pyttsx3
+            print("Initializing Apple TTS with pyttsx3...")
+            self.tts_engine = pyttsx3.init("nsss")  # Use NSSpeechSynthesizer on macOS
+
+            # Set voice to Samantha (female voice)
+            voices = self.tts_engine.getProperty("voices")
+            for voice in voices:
+                if "samantha" in voice.name.lower():
+                    self.tts_engine.setProperty("voice", voice.id)
+                    break
+
+            # Set speech rate and volume
+            self.tts_engine.setProperty("rate", 200)  # Adjust speaking rate
+            self.tts_engine.setProperty("volume", 1.0)  # Max volume
+
+            print("✅ Apple TTS initialized with pyttsx3")
+            self.piper_voice = None  # Not needed on macOS
+        else:
+            # On other platforms, use Piper TTS
+            self.tts_engine = None
+            self._init_piper()
 
     def _init_piper(self):
         """Initialize Piper TTS model."""
@@ -232,7 +249,7 @@ class VoiceChatAgent:
             return ""
 
     def format_conversation_for_qwen(self, user_text: str) -> List[dict]:
-        """Format the conversation history for Qwen VL chat format."""
+        """Format the conversation history for Qwen3 chat format."""
         messages = []
 
         # Add system message
@@ -242,57 +259,45 @@ class VoiceChatAgent:
         for msg in self.conversation_history:
             messages.append(msg)
 
-        # Add current user message (text only for now)
-        messages.append(
-            {"role": "user", "content": [{"type": "text", "text": user_text}]}
-        )
+        # Add current user message with /no_think prefix
+        messages.append({"role": "user", "content": f"/no_think {user_text}"})
 
         return messages
 
     async def get_qwen_response(self, user_text: str) -> str:
-        """Get response from Qwen model."""
+        """Get response from Qwen model using MLX."""
         try:
-            # Format the conversation for Qwen VL
+            # Format the conversation for Qwen3
             messages = self.format_conversation_for_qwen(user_text)
 
-            # Prepare the text input using qwen_vl_utils
-            text = self.qwen_processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            # Prepare the prompt using tokenizer chat template if available
+            if self.qwen_tokenizer.chat_template is not None:
+                prompt = self.qwen_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                # Fallback to simple prompt format
+                prompt = f"System: {self.system_message}\n\n"
+                for msg in self.conversation_history:
+                    role = msg["role"].capitalize()
+                    content = msg["content"]
+                    prompt += f"{role}: {content}\n"
+                prompt += f"User: /no_think {user_text}\nAssistant:"
+
+            print(f"📊 Prompt length: {len(prompt)} characters")
+
+            # Generate response using MLX-LM
+            response_text = generate(
+                self.qwen_model,
+                self.qwen_tokenizer,
+                prompt=prompt,
+                max_tokens=self.max_tokens,
+                verbose=False,
             )
 
-            # Process the inputs (no images for voice-only chat)
-            image_inputs, video_inputs = process_vision_info(messages)
-
-            # Tokenize
-            inputs = self.qwen_processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(self.device)
-
-            # Print context size information
-            context_tokens = inputs["input_ids"].shape[1]
-            print(f"📊 Context size: {context_tokens} tokens")
-
-            # Generate response
-            with torch.no_grad():
-                outputs = self.qwen_model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_tokens,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=self.qwen_processor.tokenizer.eos_token_id,
-                    eos_token_id=self.qwen_processor.tokenizer.eos_token_id,
-                )
-
-            # Decode response (excluding the input prompt)
-            response_tokens = outputs[0][inputs["input_ids"].shape[1] :]
-            response_text = self.qwen_processor.decode(
-                response_tokens, skip_special_tokens=True
-            ).strip()
+            # Clean up the response (remove the prompt if it's included)
+            if response_text.startswith(prompt):
+                response_text = response_text[len(prompt) :].strip()
 
             # Add to conversation history (using simple format for history)
             self.conversation_history.append({"role": "user", "content": user_text})
@@ -333,7 +338,7 @@ class VoiceChatAgent:
         return clean_text
 
     def synthesize_speech(self, text: str) -> bool:
-        """Convert text to speech using Piper TTS."""
+        """Convert text to speech using Apple TTS on macOS or Piper TTS on other platforms."""
         try:
             # Clean text to remove markdown and prevent SSML conflicts
             clean_text = self.clean_text_for_tts(text)
@@ -344,9 +349,38 @@ class VoiceChatAgent:
 
             print(f"🧹 Cleaned text: {clean_text}")
 
+            # Check if we're on macOS and use Apple TTS
+            if platform.system() == "Darwin":
+                return self._synthesize_with_apple_tts(clean_text)
+            else:
+                return self._synthesize_with_piper_tts(clean_text)
+
+        except Exception as e:
+            print(f"❌ Speech synthesis error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def _synthesize_with_apple_tts(self, text: str) -> bool:
+        """Use Apple's TTS API via pyttsx3."""
+        try:
+            # Use pyttsx3 to speak the text
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()  # Wait for speech to complete
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Apple TTS error: {e}")
+            return False
+
+    def _synthesize_with_piper_tts(self, text: str) -> bool:
+        """Use Piper TTS for non-macOS platforms."""
+        try:
             # Generate audio using Piper
             audio_bytes = b""
-            for audio_chunk in self.piper_voice.synthesize(clean_text):
+            for audio_chunk in self.piper_voice.synthesize(text):
                 # AudioChunk objects have audio_int16_bytes attribute
                 audio_bytes += audio_chunk.audio_int16_bytes
 
@@ -368,10 +402,7 @@ class VoiceChatAgent:
             return True
 
         except Exception as e:
-            print(f"❌ Speech synthesis error: {e}")
-            import traceback
-
-            traceback.print_exc()
+            print(f"❌ Piper TTS error: {e}")
             return False
 
     def play_audio_file(self, file_path: str):
@@ -588,8 +619,8 @@ async def main():
     )
     parser.add_argument(
         "--qwen-model",
-        default="Qwen/Qwen2.5-VL-3B-Instruct",
-        help="Qwen model name from Hugging Face (default: Qwen/Qwen2.5-VL-3B-Instruct)",
+        default="mlx-community/Qwen3-1.7B-6bit",
+        help="Qwen model name from Hugging Face (default: mlx-community/Qwen3-1.7B-6bit)",
     )
     parser.add_argument(
         "--speech-threshold",
@@ -616,15 +647,17 @@ async def main():
     PIPER_MODEL_PATH = "./piper_models/en_US-hfc_female-medium.onnx"
     PIPER_CONFIG_PATH = "./piper_models/en_US-hfc_female-medium.onnx.json"
 
-    if not os.path.exists(PIPER_MODEL_PATH):
-        print(f"❌ Piper model not found at {PIPER_MODEL_PATH}")
-        print("Download models from: https://github.com/rhasspy/piper/releases")
-        return
+    # Check for Piper models only if not on macOS
+    if platform.system() != "Darwin":
+        if not os.path.exists(PIPER_MODEL_PATH):
+            print(f"❌ Piper model not found at {PIPER_MODEL_PATH}")
+            print("Download models from: https://github.com/rhasspy/piper/releases")
+            return
 
-    if not os.path.exists(PIPER_CONFIG_PATH):
-        print(f"❌ Piper config not found at {PIPER_CONFIG_PATH}")
-        print("Make sure to download both .onnx and .json files")
-        return
+        if not os.path.exists(PIPER_CONFIG_PATH):
+            print(f"❌ Piper config not found at {PIPER_CONFIG_PATH}")
+            print("Make sure to download both .onnx and .json files")
+            return
 
     # Show configuration
     if args.playback_audio:
