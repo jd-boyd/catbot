@@ -15,6 +15,7 @@ import tempfile
 import os
 import io
 import argparse
+import time
 
 # Disable tokenizers parallelism warning in multiprocessing context
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -25,7 +26,7 @@ from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
 
-import whisper
+import mlx_whisper
 from piper import PiperVoice
 from mlx_lm import load, generate
 import strip_markdown
@@ -93,6 +94,7 @@ class VoiceChatAgent:
         self.is_recording = False
         self.silence_counter = 0
         self.conversation_history = []
+        self.is_speaking = False  # Flag to prevent feedback during TTS
 
         # Async queues
         self.audio_queue = asyncio.Queue()
@@ -127,8 +129,10 @@ class VoiceChatAgent:
 
     def _init_whisper(self, model_name: str):
         """Initialize Whisper STT model."""
-        print(f"Loading Whisper model: {model_name}...")
-        self.whisper_model = whisper.load_model(model_name)
+        # Use MLX-optimized 4-bit quantized model for better performance
+        hf_model_name = "mlx-community/whisper-medium.en-mlx-4bit"
+        print(f"Loading Whisper model: {model_name} -> {hf_model_name}...")
+        self.whisper_model = mlx_whisper.load_models.load_model(hf_model_name)
         print("✅ Whisper loaded")
 
     def _init_qwen(self):
@@ -216,7 +220,7 @@ class VoiceChatAgent:
         return speech_prob > self.speech_threshold
 
     def transcribe_audio(self, audio_data: np.ndarray) -> str:
-        """Transcribe audio using Whisper."""
+        """Transcribe audio using MLX Whisper."""
         try:
             # Create temporary file
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
@@ -229,11 +233,10 @@ class VoiceChatAgent:
                     audio_int16 = (audio_data * 32767).astype(np.int16)
                     wav_file.writeframes(audio_int16.tobytes())
 
-                # Transcribe with explicit FP32 to avoid warning
-                result = self.whisper_model.transcribe(
+                # Transcribe using mlx_whisper.transcribe function
+                result = mlx_whisper.transcribe(
                     tmp_file.name,
-                    language="en",
-                    fp16=False,  # Explicitly use FP32 to avoid CPU warning
+                    path_or_hf_repo="mlx-community/whisper-medium.en-mlx-4bit",
                 )
                 text = result["text"].strip()
 
@@ -363,19 +366,32 @@ class VoiceChatAgent:
     def _synthesize_with_apple_tts(self, text: str) -> bool:
         """Use Apple's TTS API via pyttsx3."""
         try:
+            # Set speaking flag to prevent audio feedback
+            self.is_speaking = True
+
             # Use pyttsx3 to speak the text
             self.tts_engine.say(text)
             self.tts_engine.runAndWait()  # Wait for speech to complete
+
+            # Add brief delay to let audio echo dissipate before reactivating microphone
+            time.sleep(0.5)
+
+            # Clear speaking flag
+            self.is_speaking = False
 
             return True
 
         except Exception as e:
             print(f"❌ Apple TTS error: {e}")
+            self.is_speaking = False
             return False
 
     def _synthesize_with_piper_tts(self, text: str) -> bool:
         """Use Piper TTS for non-macOS platforms."""
         try:
+            # Set speaking flag to prevent audio feedback
+            self.is_speaking = True
+
             # Generate audio using Piper
             audio_bytes = b""
             for audio_chunk in self.piper_voice.synthesize(text):
@@ -397,10 +413,17 @@ class VoiceChatAgent:
                 # Clean up
                 os.unlink(tmp_file.name)
 
+            # Add brief delay to let audio echo dissipate before reactivating microphone
+            time.sleep(0.5)
+
+            # Clear speaking flag
+            self.is_speaking = False
+
             return True
 
         except Exception as e:
             print(f"❌ Piper TTS error: {e}")
+            self.is_speaking = False
             return False
 
     def play_audio_file(self, file_path: str):
@@ -476,34 +499,42 @@ class VoiceChatAgent:
                     vad_chunk = vad_buffer[: self.vad_chunk_size]
                     vad_buffer = vad_buffer[self.vad_chunk_size :]
 
-                    # Detect speech
-                    has_speech = self.detect_speech(vad_chunk)
+                    # Detect speech only if we're not currently speaking (to prevent feedback)
+                    if not self.is_speaking:
+                        has_speech = self.detect_speech(vad_chunk)
 
-                    if has_speech:
-                        if not self.is_recording:
-                            print("🗣️  Speech detected, recording...")
-                            self.is_recording = True
-                            self.audio_buffer = []
+                        if has_speech:
+                            if not self.is_recording:
+                                print("🗣️  Speech detected, recording...")
+                                self.is_recording = True
+                                self.audio_buffer = []
 
-                        # Add the VAD chunk (not the full audio_chunk) to buffer
-                        self.audio_buffer.extend(vad_chunk)
-                        self.silence_counter = 0
-
-                    else:
-                        if self.is_recording:
-                            self.silence_counter += 1
-                            # Add the VAD chunk to buffer during recording
+                            # Add the VAD chunk (not the full audio_chunk) to buffer
                             self.audio_buffer.extend(vad_chunk)
+                            self.silence_counter = 0
 
-                            # Check if we've had enough silence to stop recording
-                            # Use VAD chunk duration instead of full chunk duration
-                            vad_chunk_duration = self.vad_chunk_size / self.sample_rate
-                            silence_duration = self.silence_counter * vad_chunk_duration
-                            if silence_duration >= self.silence_duration:
-                                print("🤫 Silence detected, processing speech...")
-                                await self._process_speech()
-                                self.is_recording = False
-                                self.silence_counter = 0
+                        else:
+                            if self.is_recording:
+                                self.silence_counter += 1
+                                # Add the VAD chunk to buffer during recording
+                                self.audio_buffer.extend(vad_chunk)
+
+                                # Check if we've had enough silence to stop recording
+                                # Use VAD chunk duration instead of full chunk duration
+                                vad_chunk_duration = (
+                                    self.vad_chunk_size / self.sample_rate
+                                )
+                                silence_duration = (
+                                    self.silence_counter * vad_chunk_duration
+                                )
+                                if silence_duration >= self.silence_duration:
+                                    print("🤫 Silence detected, processing speech...")
+                                    await self._process_speech()
+                                    self.is_recording = False
+                                    self.silence_counter = 0
+                    else:
+                        # If we're speaking, skip all audio processing to prevent feedback
+                        pass
 
             except Exception as e:
                 print(f"❌ Audio processing error: {e}")
