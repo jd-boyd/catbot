@@ -16,6 +16,7 @@ import os
 import io
 import argparse
 import time
+import uuid
 
 # Disable tokenizers parallelism warning in multiprocessing context
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -27,10 +28,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import mlx_whisper
-from piper import PiperVoice
 from mlx_lm import load, generate
 import strip_markdown
-import pyttsx3
+from conversation_db import ConversationDB
+from tts_engines import TTSFactory
 
 
 @dataclass
@@ -45,8 +46,14 @@ class VoiceChatAgent:
         self,
         whisper_model: str = "base",
         qwen_model_name: str = "mlx-community/Qwen3-1.7B-6bit",
+        tts_engine: str = "auto",
         piper_model_path: str = "./piper_models/en_US-hfc_female-medium.onnx",
         piper_config_path: str = "./piper_models/en_US-hfc_female-medium.onnx.json",
+        kokoro_model_id: str = "prince-canuma/Kokoro-82M",
+        kokoro_voice: str = "af_heart",
+        f5_model_name: str = "lucasnewman/f5-tts-mlx",
+        f5_ref_audio_path: Optional[str] = None,
+        f5_ref_audio_text: Optional[str] = None,
         sample_rate: int = 16000,
         chunk_duration: float = 0.5,
         speech_threshold: float = 0.5,
@@ -60,8 +67,14 @@ class VoiceChatAgent:
         Args:
             whisper_model: Whisper model size (tiny, base, small, medium, large)
             qwen_model_name: Qwen model name from Hugging Face
+            tts_engine: TTS engine type ('auto', 'apple', 'piper', 'kokoro', 'f5')
             piper_model_path: Path to Piper TTS model (.onnx file)
             piper_config_path: Path to Piper TTS config (.json file)
+            kokoro_model_id: Kokoro model ID from Hugging Face
+            kokoro_voice: Kokoro voice name
+            f5_model_name: F5-TTS model name
+            f5_ref_audio_path: Optional path to reference audio for F5-TTS voice cloning
+            f5_ref_audio_text: Optional text transcript of reference audio
             sample_rate: Audio sample rate (16kHz recommended)
             chunk_duration: Duration of each audio chunk in seconds
             speech_threshold: VAD threshold (0.0-1.0)
@@ -76,8 +89,14 @@ class VoiceChatAgent:
         self.vad_chunk_size = 512 if sample_rate == 16000 else 256
         self.speech_threshold = speech_threshold
         self.silence_duration = silence_duration
+        self.tts_engine_type = tts_engine
         self.piper_model_path = piper_model_path
         self.piper_config_path = piper_config_path
+        self.kokoro_model_id = kokoro_model_id
+        self.kokoro_voice = kokoro_voice
+        self.f5_model_name = f5_model_name
+        self.f5_ref_audio_path = f5_ref_audio_path
+        self.f5_ref_audio_text = f5_ref_audio_text
         self.playback_audio = playback_audio
         self.max_tokens = max_tokens
         self.qwen_model_name = qwen_model_name
@@ -88,6 +107,7 @@ class VoiceChatAgent:
         self._init_qwen()
         self._init_tts()
         self._init_audio()
+        self._init_database()
 
         # State management
         self.audio_buffer = []
@@ -95,6 +115,7 @@ class VoiceChatAgent:
         self.silence_counter = 0
         self.conversation_history = []
         self.is_speaking = False  # Flag to prevent feedback during TTS
+        self.session_id = str(uuid.uuid4())  # Unique session identifier
 
         # Async queues
         self.audio_queue = asyncio.Queue()
@@ -103,10 +124,7 @@ class VoiceChatAgent:
         print("🎤 Voice Chat Agent initialized!")
         print(f"Using Whisper model: {whisper_model}")
         print(f"Using Qwen model: {qwen_model_name}")
-        if platform.system() == "Darwin":
-            print("Using Apple TTS with Samantha voice")
-        else:
-            print(f"Using Piper model: {piper_model_path}")
+        print(f"Session ID: {self.session_id[:8]}...")
 
     def _init_vad(self):
         """Initialize Silero VAD model."""
@@ -150,49 +168,57 @@ class VoiceChatAgent:
         print("✅ Qwen model loaded")
 
     def _init_tts(self):
-        """Initialize TTS model based on platform."""
-        if platform.system() == "Darwin":
-            # On macOS, we use Apple's TTS via pyttsx3
-            print("Initializing Apple TTS with pyttsx3...")
-            self.tts_engine = pyttsx3.init("nsss")  # Use NSSpeechSynthesizer on macOS
-
-            # Set voice to Samantha (female voice)
-            voices = self.tts_engine.getProperty("voices")
-            for voice in voices:
-                if "samantha" in voice.name.lower():
-                    self.tts_engine.setProperty("voice", voice.id)
-                    break
-
-            # Set speech rate and volume
-            self.tts_engine.setProperty("rate", 200)  # Adjust speaking rate
-            self.tts_engine.setProperty("volume", 1.0)  # Max volume
-
-            print("✅ Apple TTS initialized with pyttsx3")
-            self.piper_voice = None  # Not needed on macOS
+        """Initialize TTS engine using modular system."""
+        # Determine which TTS engine to use
+        if self.tts_engine_type == "auto":
+            engine_type = TTSFactory.get_recommended_engine()
+            print(f"Auto-selecting TTS engine: {engine_type}")
         else:
-            # On other platforms, use Piper TTS
-            self.tts_engine = None
-            self._init_piper()
-
-    def _init_piper(self):
-        """Initialize Piper TTS model."""
-        print("Loading Piper TTS model...")
-        try:
-            self.piper_voice = PiperVoice.load(
-                self.piper_model_path,
-                config_path=self.piper_config_path,
-                use_cuda=torch.cuda.is_available(),
+            engine_type = self.tts_engine_type
+        
+        # Create engine with appropriate parameters
+        if engine_type == "apple":
+            self.tts_engine = TTSFactory.create_engine("apple")
+        elif engine_type == "piper":
+            self.tts_engine = TTSFactory.create_engine(
+                "piper",
+                model_path=self.piper_model_path,
+                config_path=self.piper_config_path
             )
-            print("✅ Piper TTS loaded")
-        except Exception as e:
-            print(f"❌ Failed to load Piper TTS: {e}")
-            print("Make sure you have both the .onnx model file and .json config file")
-            raise
+        elif engine_type == "kokoro":
+            self.tts_engine = TTSFactory.create_engine(
+                "kokoro",
+                model_id=self.kokoro_model_id,
+                voice=self.kokoro_voice
+            )
+        elif engine_type == "f5":
+            self.tts_engine = TTSFactory.create_engine(
+                "f5",
+                model_name=self.f5_model_name,
+                ref_audio_path=self.f5_ref_audio_path,
+                ref_audio_text=self.f5_ref_audio_text
+            )
+        else:
+            print(f"❌ Unknown TTS engine: {engine_type}")
+            raise ValueError(f"Unsupported TTS engine: {engine_type}")
+        
+        if not self.tts_engine:
+            raise RuntimeError(f"Failed to initialize {engine_type} TTS engine")
 
     def _init_audio(self):
         """Initialize PyAudio for microphone input."""
         self.p = pyaudio.PyAudio()
         print("✅ Audio system initialized")
+
+    def _init_database(self):
+        """Initialize conversation database."""
+        try:
+            self.db = ConversationDB()
+            print("✅ Conversation database initialized")
+        except Exception as e:
+            print(f"⚠️  Database initialization warning: {e}")
+            print("Continuing without database logging...")
+            self.db = None
 
     def detect_speech(self, audio_chunk: np.ndarray) -> bool:
         """Use Silero VAD to detect speech in audio chunk."""
@@ -339,7 +365,7 @@ class VoiceChatAgent:
         return clean_text
 
     def synthesize_speech(self, text: str) -> bool:
-        """Convert text to speech using Apple TTS on macOS or Piper TTS on other platforms."""
+        """Convert text to speech using the configured TTS engine."""
         try:
             # Clean text to remove markdown and prevent SSML conflicts
             clean_text = self.clean_text_for_tts(text)
@@ -350,80 +376,18 @@ class VoiceChatAgent:
 
             print(f"🧹 Cleaned text: {clean_text}")
 
-            # Check if we're on macOS and use Apple TTS
-            if platform.system() == "Darwin":
-                return self._synthesize_with_apple_tts(clean_text)
-            else:
-                return self._synthesize_with_piper_tts(clean_text)
+            # Use the modular TTS engine
+            success = self.tts_engine.speak(clean_text, self.play_audio_file_from_bytes)
+            
+            # Update speaking state
+            self.is_speaking = self.tts_engine.is_speaking
+            
+            return success
 
         except Exception as e:
             print(f"❌ Speech synthesis error: {e}")
             import traceback
-
             traceback.print_exc()
-            return False
-
-    def _synthesize_with_apple_tts(self, text: str) -> bool:
-        """Use Apple's TTS API via pyttsx3."""
-        try:
-            # Set speaking flag to prevent audio feedback
-            self.is_speaking = True
-
-            # Use pyttsx3 to speak the text
-            self.tts_engine.say(text)
-            self.tts_engine.runAndWait()  # Wait for speech to complete
-
-            # Add brief delay to let audio echo dissipate before reactivating microphone
-            time.sleep(0.5)
-
-            # Clear speaking flag
-            self.is_speaking = False
-
-            return True
-
-        except Exception as e:
-            print(f"❌ Apple TTS error: {e}")
-            self.is_speaking = False
-            return False
-
-    def _synthesize_with_piper_tts(self, text: str) -> bool:
-        """Use Piper TTS for non-macOS platforms."""
-        try:
-            # Set speaking flag to prevent audio feedback
-            self.is_speaking = True
-
-            # Generate audio using Piper
-            audio_bytes = b""
-            for audio_chunk in self.piper_voice.synthesize(text):
-                # AudioChunk objects have audio_int16_bytes attribute
-                audio_bytes += audio_chunk.audio_int16_bytes
-
-            # Create a temporary WAV file
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-                # Write WAV header and audio data
-                with wave.open(tmp_file.name, "wb") as wav_file:
-                    wav_file.setnchannels(1)  # Mono
-                    wav_file.setsampwidth(2)  # 16-bit
-                    wav_file.setframerate(self.piper_voice.config.sample_rate)
-                    wav_file.writeframes(audio_bytes)
-
-                # Play the audio
-                self.play_audio_file(tmp_file.name)
-
-                # Clean up
-                os.unlink(tmp_file.name)
-
-            # Add brief delay to let audio echo dissipate before reactivating microphone
-            time.sleep(0.5)
-
-            # Clear speaking flag
-            self.is_speaking = False
-
-            return True
-
-        except Exception as e:
-            print(f"❌ Piper TTS error: {e}")
-            self.is_speaking = False
             return False
 
     def play_audio_file(self, file_path: str):
@@ -455,6 +419,26 @@ class VoiceChatAgent:
 
         except Exception as e:
             print(f"❌ Audio playback error: {e}")
+
+    def play_audio_file_from_bytes(self, audio_data: bytes, sample_rate: int, channels: int, sample_width: int) -> bool:
+        """Play audio from bytes data."""
+        try:
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                tmp_file.write(audio_data)
+                tmp_file.flush()
+                
+                # Play the file
+                self.play_audio_file(tmp_file.name)
+                
+                # Clean up
+                os.unlink(tmp_file.name)
+                
+                return True
+                
+        except Exception as e:
+            print(f"❌ Audio bytes playback error: {e}")
+            return False
 
     async def audio_stream_generator(self) -> AsyncGenerator[np.ndarray, None]:
         """Generate audio chunks from microphone asynchronously."""
@@ -603,9 +587,29 @@ class VoiceChatAgent:
                 # Wait for user text from speech processing
                 user_text = await self.response_queue.get()
 
+                # Start timing for database logging
+                start_time = time.time()
+
                 print("🤖 Getting Qwen response...")
                 response = await self.get_qwen_response(user_text)
                 print(f"🤖 Qwen: {response}")
+
+                # Calculate processing time
+                processing_time_ms = int((time.time() - start_time) * 1000)
+
+                # Log conversation to database
+                if self.db:
+                    try:
+                        conversation_id = self.db.log_conversation(
+                            user_input=user_text,
+                            ai_response=response,
+                            response_tokens=len(response.split()),  # Rough token estimate
+                            processing_time_ms=processing_time_ms,
+                            session_id=self.session_id
+                        )
+                        print(f"💾 Conversation logged (ID: {conversation_id})")
+                    except Exception as db_error:
+                        print(f"⚠️  Database logging error: {db_error}")
 
                 print("🔊 Converting to speech...")
                 self.synthesize_speech(response)
@@ -629,6 +633,12 @@ class VoiceChatAgent:
             print("\n🛑 Stopping voice chat...")
         finally:
             self.p.terminate()
+            if self.db:
+                self.db.close()
+                print("💾 Database connection closed")
+            if self.tts_engine:
+                self.tts_engine.cleanup()
+                print("🔊 TTS engine cleaned up")
 
 
 async def main():
@@ -669,6 +679,35 @@ async def main():
         default=512,
         help="Maximum tokens for Qwen response (default: 512)",
     )
+    parser.add_argument(
+        "--tts-engine",
+        default="auto",
+        choices=["auto", "apple", "piper", "kokoro", "f5"],
+        help="TTS engine to use (default: auto)",
+    )
+    parser.add_argument(
+        "--kokoro-model",
+        default="prince-canuma/Kokoro-82M",
+        help="Kokoro model ID (default: prince-canuma/Kokoro-82M)",
+    )
+    parser.add_argument(
+        "--kokoro-voice",
+        default="af_heart",
+        help="Kokoro voice name (default: af_heart)",
+    )
+    parser.add_argument(
+        "--f5-model",
+        default="lucasnewman/f5-tts-mlx",
+        help="F5-TTS model name (default: lucasnewman/f5-tts-mlx)",
+    )
+    parser.add_argument(
+        "--f5-ref-audio",
+        help="Path to reference audio file for F5-TTS voice cloning",
+    )
+    parser.add_argument(
+        "--f5-ref-text",
+        help="Text transcript of reference audio for F5-TTS",
+    )
 
     args = parser.parse_args()
 
@@ -701,8 +740,14 @@ async def main():
     agent = VoiceChatAgent(
         whisper_model=args.whisper_model,
         qwen_model_name=args.qwen_model,
+        tts_engine=args.tts_engine,
         piper_model_path=PIPER_MODEL_PATH,
         piper_config_path=PIPER_CONFIG_PATH,
+        kokoro_model_id=args.kokoro_model,
+        kokoro_voice=args.kokoro_voice,
+        f5_model_name=args.f5_model,
+        f5_ref_audio_path=args.f5_ref_audio,
+        f5_ref_audio_text=args.f5_ref_text,
         speech_threshold=args.speech_threshold,
         silence_duration=args.silence_duration,
         playback_audio=args.playback_audio,
