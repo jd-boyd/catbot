@@ -1,7 +1,8 @@
 import serial
+import serial.tools.list_ports
 import time
 import threading
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 
 class VISCAError(Exception):
@@ -67,7 +68,7 @@ class VISCACamera:
             self.serial_connection.reset_output_buffer()
 
             # Test connection with address set command
-            return self._address_set()
+            #return self._address_set()
 
         except serial.SerialException as e:
             print(f"Failed to connect: {e}")
@@ -309,15 +310,136 @@ class VISCACamera:
         command = [0x01, 0x06, 0x02, pan_speed, tilt_speed] + pan_bytes + tilt_bytes
         self._send_command(command)
 
+    def scan_camera_ids(self) -> list:
+        """
+        Scan for available VISCA camera IDs on the connected port.
+
+        Returns:
+            List of detected camera addresses (1-7)
+        """
+        if not self.serial_connection or not self.serial_connection.is_open:
+            raise VISCAError("Not connected to port")
+
+        detected_cameras = []
+        original_address = self.camera_address
+
+        # Test each possible camera address (1-7)
+        for test_address in range(1, 8):
+            print("testing ", test_address)
+            self.camera_address = test_address
+
+            try:
+                # Try to get camera info or send a simple inquiry
+                response = self._send_command([0x09, 0x04, 0x00])
+                print("Found camera.")
+                if response and len(response) > 0:
+                    detected_cameras.append(test_address)
+            except VISCAError:
+                # Camera didn't respond, not present
+                continue
+            except Exception:
+                # Any other error, skip this address
+                continue
+
+        # Restore original camera address
+        self.camera_address = original_address
+
+        return detected_cameras
+
+
+def list_serial_ports() -> List[dict]:
+    """
+    List available USB serial ports on macOS, Linux, and Windows.
+
+    Returns:
+        List of dictionaries containing port information:
+        - device: Port device name (e.g., '/dev/cu.usbserial-1140', 'COM3')
+        - description: Human-readable description
+        - hwid: Hardware ID if available
+        - manufacturer: Manufacturer name if available
+        - product: Product name if available
+    """
+    ports = []
+
+    for port in serial.tools.list_ports.comports():
+        port_info = {
+            'device': port.device,
+            'description': port.description or 'Unknown',
+            'hwid': port.hwid or 'Unknown',
+            'manufacturer': port.manufacturer or 'Unknown',
+            'product': port.product or 'Unknown'
+        }
+        ports.append(port_info)
+
+    return ports
+
+
+def find_usb_serial_ports() -> List[dict]:
+    """
+    Find USB serial ports (filters out built-in serial ports).
+
+    Returns:
+        List of dictionaries containing USB serial port information
+    """
+    usb_ports = []
+
+    for port in serial.tools.list_ports.comports():
+        # Filter for USB devices (common patterns)
+        device_lower = port.device.lower()
+        desc_lower = (port.description or '').lower()
+
+        is_usb = (
+            'usb' in device_lower or
+            'usb' in desc_lower or
+            'cu.usb' in device_lower or  # macOS USB serial
+            'ttyusb' in device_lower or  # Linux USB serial
+            'ttyacm' in device_lower or  # Linux USB CDC ACM
+            'com' in device_lower        # Windows COM ports (may include USB)
+        )
+
+        if is_usb:
+            port_info = {
+                'device': port.device,
+                'description': port.description or 'Unknown',
+                'hwid': port.hwid or 'Unknown',
+                'manufacturer': port.manufacturer or 'Unknown',
+                'product': port.product or 'Unknown'
+            }
+            usb_ports.append(port_info)
+
+    return usb_ports
+
 
 # Example usage
 if __name__ == "__main__":
+    # List available serial ports
+    print("Available serial ports:")
+    for port in list_serial_ports():
+        print(f"  {port['device']}: {port['description']}")
+
+    print("\nUSB serial ports:")
+    usb_ports = find_usb_serial_ports()
+    for port in usb_ports:
+        print(f"  {port['device']}: {port['description']}")
+
+    if not usb_ports:
+        print("  No USB serial ports found")
+        exit()
+
+    # Use first USB port for camera connection
+    port_device = usb_ports[0]['device']
+    print(f"\nUsing port: {port_device}")
+
     # Example usage of the VISCA camera library
-    camera = VISCACamera(port='COM3', baudrate=9600, camera_address=1)  # Adjust port as needed
+    camera = VISCACamera(port=port_device, baudrate=9600, camera_address=1)
 
     try:
         if camera.connect():
             print("Connected to camera successfully!")
+
+            # Scan for available camera IDs
+            detected_cameras = camera.scan_camera_ids()
+            print(f"Detected cameras at addresses: {detected_cameras}")
 
             # Basic camera operations
             camera.home()  # Move to home position
@@ -369,5 +491,5 @@ def nod(vc, speed, pause, cnt):
 
 #vc = visca.VISCACamera(v_port, camera_address=1)
 #vc.connect()
-shake(vc, 12, 0.2, 3)
-nod(vc, 12, 0.2, 3)
+#shake(vc, 12, 0.2, 3)
+#nod(vc, 12, 0.2, 3)
